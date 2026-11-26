@@ -233,9 +233,13 @@ impl Store {
     }
 
     pub fn close(&self) {
-        let mut guard = crate::util::lock(&self.write);
-        guard.lock.take();
-        guard.session = None;
+        let hashes = self.membership_hashes();
+        {
+            let mut guard = crate::util::lock(&self.write);
+            guard.lock.take();
+            guard.session = None;
+        }
+        crate::proof::evict_partials(hashes.iter().map(String::as_str));
     }
 
     pub fn unlock(&self, password: &str) -> Result<usize, ApiError> {
@@ -369,7 +373,9 @@ impl Store {
     }
 
     pub fn lock(&self) {
+        let hashes = self.membership_hashes();
         crate::util::lock(&self.write).session = None;
+        crate::proof::evict_partials(hashes.iter().map(String::as_str));
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -714,9 +720,22 @@ impl Store {
         Arc::clone(&crate::util::lock(&self.snapshot))
     }
 
+    fn membership_hashes(&self) -> Vec<String> {
+        self.snapshot_arc().records.keys().cloned().collect()
+    }
+
     fn swap_snapshot(&self, inner: &Inner) {
         let next = build_snapshot(inner, Some(&self.snapshot_arc()));
+        let quarantined: Vec<String> = next
+            .records
+            .values()
+            .filter(|record| record.quarantined)
+            .map(|record| record.hash.clone())
+            .collect();
         *crate::util::lock(&self.snapshot) = Arc::new(next);
+        if !quarantined.is_empty() {
+            crate::proof::evict_partials(quarantined.iter().map(String::as_str));
+        }
     }
 }
 

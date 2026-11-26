@@ -172,6 +172,9 @@ pub(crate) fn emit_transition(
     prior: MembershipState,
     new_state: MembershipState,
 ) {
+    if prior.is_usable() && !new_state.is_usable() {
+        crate::proof::evict_partial(hash);
+    }
     if let Some((registry_id, rln_identifier, membership_hash, state, previous)) =
         transition_event(hash, record, prior, new_state)
     {

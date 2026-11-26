@@ -10,15 +10,96 @@ struct CachedPath {
     path_elements_hex: Vec<String>,
     path_indices: Vec<u8>,
     leaf_index: u64,
+    version: u64,
 }
 
-static PATHS: Mutex<Option<HashMap<String, CachedPath>>> = Mutex::new(None);
+struct PathSlot {
+    published: Option<CachedPath>,
+    /// Highest generation claimed for this membership. A fetch claims one
+    /// before it reads the tree, so a slow older fetch cannot publish over
+    /// a newer one.
+    next_version: u64,
+}
 
-pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<(Vec<String>, Vec<u8>)> {
+static PATHS: Mutex<Option<HashMap<String, PathSlot>>> = Mutex::new(None);
+
+pub(crate) struct ServedPath {
+    pub(crate) path_elements_hex: Vec<String>,
+    pub(crate) path_indices: Vec<u8>,
+    pub(crate) version: u64,
+}
+
+pub(crate) struct PreparedPath {
+    pub(crate) path_elements_hex: Vec<String>,
+    pub(crate) path_indices: Vec<u8>,
+    pub(crate) leaf_index: u64,
+    pub(crate) version: u64,
+}
+
+pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<ServedPath> {
     let guard = lock(&PATHS);
-    let entry = guard.as_ref()?.get(hash)?;
-    (entry.leaf_index == current_leaf_index)
-        .then(|| (entry.path_elements_hex.clone(), entry.path_indices.clone()))
+    let entry = guard.as_ref()?.get(hash)?.published.as_ref()?;
+    (entry.leaf_index == current_leaf_index).then(|| ServedPath {
+        path_elements_hex: entry.path_elements_hex.clone(),
+        path_indices: entry.path_indices.clone(),
+        version: entry.version,
+    })
+}
+
+fn claim_version(hash: &str) -> u64 {
+    let mut guard = lock(&PATHS);
+    let map = guard.get_or_insert_with(HashMap::new);
+    let slot = map.entry(hash.to_string()).or_insert(PathSlot {
+        published: None,
+        next_version: 0,
+    });
+    slot.next_version = slot.next_version.saturating_add(1);
+    slot.next_version
+}
+
+/// Fetch and adopt roots, but do not publish. The caller warms the partial
+/// against this path, then `publish_path`, so proofs keep hitting the previous
+/// path during the build.
+pub(crate) fn fetch_path(
+    registry: &CanonicalRegistryId,
+    hash: &str,
+    leaf_index: u64,
+    tree: &dyn TreeSource,
+) -> Result<PreparedPath, ApiError> {
+    let version = claim_version(hash);
+    let witness = tree.merkle_proof(registry, leaf_index)?.lifted();
+    match witness.window {
+        Some(window) => crate::roots::adopt(&registry.canonical, window),
+        None => crate::roots::admit(&registry.canonical, witness.root),
+    }
+    Ok(PreparedPath {
+        path_elements_hex: witness.path_elements_hex,
+        path_indices: witness.path_indices,
+        leaf_index,
+        version,
+    })
+}
+
+/// Publish `prepared` unless a newer generation is already visible.
+pub(crate) fn publish_path(hash: &str, prepared: PreparedPath) -> bool {
+    let mut guard = lock(&PATHS);
+    let Some(slot) = guard.as_mut().and_then(|map| map.get_mut(hash)) else {
+        return false;
+    };
+    if slot
+        .published
+        .as_ref()
+        .is_some_and(|current| current.version > prepared.version)
+    {
+        return false;
+    }
+    slot.published = Some(CachedPath {
+        path_elements_hex: prepared.path_elements_hex,
+        path_indices: prepared.path_indices,
+        leaf_index: prepared.leaf_index,
+        version: prepared.version,
+    });
+    true
 }
 
 pub(crate) fn fill_path_cache(
@@ -27,20 +108,8 @@ pub(crate) fn fill_path_cache(
     leaf_index: u64,
     tree: &dyn TreeSource,
 ) -> Result<(), ApiError> {
-    let witness = tree.merkle_proof(registry, leaf_index)?.lifted();
-    match witness.window {
-        Some(window) => crate::roots::adopt(&registry.canonical, window),
-        None => crate::roots::admit(&registry.canonical, witness.root),
-    }
-    let (path_elements_hex, path_indices) = (witness.path_elements_hex, witness.path_indices);
-    lock(&PATHS).get_or_insert_with(HashMap::new).insert(
-        hash.to_string(),
-        CachedPath {
-            path_elements_hex,
-            path_indices,
-            leaf_index,
-        },
-    );
+    let prepared = fetch_path(registry, hash, leaf_index, tree)?;
+    publish_path(hash, prepared);
     Ok(())
 }
 
@@ -51,12 +120,14 @@ pub(crate) fn set_path_for_test(
     path_indices: Vec<u8>,
     leaf_index: u64,
 ) {
-    lock(&PATHS).get_or_insert_with(HashMap::new).insert(
-        hash.to_string(),
-        CachedPath {
+    let version = claim_version(hash);
+    publish_path(
+        hash,
+        PreparedPath {
             path_elements_hex,
             path_indices,
             leaf_index,
+            version,
         },
     );
 }
@@ -102,9 +173,9 @@ mod tests {
     fn fresh_entry_hits_leaf_mismatch_misses() {
         let hash = "path-cache-test-fresh";
         set_path_for_test(hash, vec!["ab".repeat(32)], vec![1], 5);
-        let (elements, indices) = hit(hash, 5).expect("fresh entry served");
-        assert_eq!(elements, vec!["ab".repeat(32)]);
-        assert_eq!(indices, vec![1]);
+        let served = hit(hash, 5).expect("fresh entry served");
+        assert_eq!(served.path_elements_hex, vec!["ab".repeat(32)]);
+        assert_eq!(served.path_indices, vec![1]);
 
         assert!(
             hit(hash, 6).is_none(),
@@ -118,12 +189,45 @@ mod tests {
         set_path_for_test(hash, vec!["00".repeat(32)], vec![0], 1);
         set_path_for_test(hash, vec!["11".repeat(32)], vec![1], 2);
 
-        let (elements, indices) = hit(hash, 2).expect("refreshed entry served");
-        assert_eq!(elements, vec!["11".repeat(32)]);
-        assert_eq!(indices, vec![1]);
+        let served = hit(hash, 2).expect("refreshed entry served");
+        assert_eq!(served.path_elements_hex, vec!["11".repeat(32)]);
+        assert_eq!(served.path_indices, vec![1]);
         assert!(
             hit(hash, 1).is_none(),
             "the old leaf_index's path is gone once the refresh overwrote it"
         );
+    }
+
+    #[test]
+    fn an_older_publish_does_not_overwrite_a_newer_path() {
+        let hash = "path-cache-test-version";
+        let older = claim_version(hash);
+        let newer = claim_version(hash);
+        assert!(newer > older);
+        assert!(publish_path(
+            hash,
+            PreparedPath {
+                path_elements_hex: vec!["22".repeat(32)],
+                path_indices: vec![1],
+                leaf_index: 2,
+                version: newer,
+            }
+        ));
+        assert!(
+            !publish_path(
+                hash,
+                PreparedPath {
+                    path_elements_hex: vec!["11".repeat(32)],
+                    path_indices: vec![0],
+                    leaf_index: 1,
+                    version: older,
+                }
+            ),
+            "a slow fetch must not publish over a newer generation"
+        );
+        let served = hit(hash, 2).expect("newer path stays visible");
+        assert_eq!(served.path_elements_hex, vec!["22".repeat(32)]);
+        assert_eq!(served.version, newer);
+        assert!(hit(hash, 1).is_none());
     }
 }

@@ -76,6 +76,8 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
 - `rust-lib/src/proof.rs` — the RLN proof engine over zerokit (stateless):
   in-module identity generation, witness assembly, generate/verify, the
   canonical `RateLimitProof` serialization, and the frozen interop vectors.
+  It keeps one in-memory partial proof per membership so a repeat proof only
+  runs `finish_proof`.
 - `rust-lib/src/rate_limit.rs` — epoch derivation + per-(rln_identifier,
   epoch) `message_id` allocation. The store fsync-durably persists an
   allocation BEFORE the proof is returned, and keeps a persisted MONOTONE
@@ -117,7 +119,8 @@ budgets, option keys — is [`docs/wire-binding.md`](docs/wire-binding.md).
   pending→failed past the 300s window; 60s non-terminal state refresh with
   erased inference. That same 60s pass also refreshes each usable
   membership's Merkle proof path into `path_cache.rs`, so `generate_proof`
-  normally serves it with zero registry I/O.
+  normally serves it with zero registry I/O. Before publishing a refreshed
+  path it rebuilds that membership's cached partial proof.
 - `rust-lib/src/select.rs` — spec `select()`: active/grace_period
   candidates only, by_hash / highest_rate_limit / round_robin (rotation
   state per (registry_id, rln_identifier) scope). Returns the PUBLIC view
