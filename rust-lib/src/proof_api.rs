@@ -12,6 +12,7 @@ use crate::roots;
 use crate::scope::{backend_of, parse_scope, records_for_registry, scope_candidates};
 use crate::sealed_store::store::Store;
 use crate::select;
+use crate::tree::TreeSource;
 use crate::util::now_unix;
 use crate::views;
 
@@ -105,6 +106,9 @@ pub(crate) fn generate_proof_with(
                 .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?
         }
     };
+    // Before a message id is reserved: a cached root that has left the
+    // accepted window is refreshed once, and still-stale is not_ready.
+    let served = refresh_if_root_left_window(&registry, hash, leaf_index, backend.tree, served)?;
 
     let retain_floor = now_epoch.saturating_sub(gap);
     let message_id =
@@ -130,6 +134,40 @@ pub(crate) fn generate_proof_with(
         obj.insert("proof_canonical".to_string(), rlp.canonical_hex().into());
     }
     Ok(out)
+}
+
+/// True when a warm window is known and does not contain `root`. No stored
+/// root, or no window yet, keeps today's behaviour: prove with the path.
+fn root_left_window(canonical: &str, root: Option<[u8; 32]>) -> bool {
+    match root {
+        Some(root) => roots::window(canonical).is_some_and(|window| !window.contains(&root)),
+        None => false,
+    }
+}
+
+/// Refill once when the cached root has left the accepted-root window, then
+/// re-check the window `fill_path_cache` just published. Still outside: a
+/// retryable error, and the caller has not reserved a message id.
+fn refresh_if_root_left_window(
+    registry: &registry_id::CanonicalRegistryId,
+    hash: &str,
+    leaf_index: u64,
+    tree: &dyn TreeSource,
+    mut served: path_cache::ServedPath,
+) -> Result<path_cache::ServedPath, ApiError> {
+    if !root_left_window(&registry.canonical, served.root) {
+        return Ok(served);
+    }
+    path_cache::fill_path_cache(registry, hash, leaf_index, tree)?;
+    served = path_cache::hit(hash, leaf_index)
+        .ok_or_else(|| ApiError::internal("path cache: fetched path vanished before use"))?;
+    if root_left_window(&registry.canonical, served.root) {
+        return Err(ApiError::new(
+            ErrorKind::NotReady,
+            "membership root is outside the accepted-root window; retry",
+        ));
+    }
+    Ok(served)
 }
 
 /// Rebuild a membership's cached partial proof for `path` when its fingerprint
@@ -1257,5 +1295,237 @@ mod tests {
             generate_proof_impl(no_store(), &registry, &rln_id_hex, "aa", &stale).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidArgument);
         assert!(err.message.contains("window"), "got: {}", err.message);
+    }
+
+    fn le_root(byte: u8) -> [u8; 32] {
+        let mut root = [0u8; 32];
+        root[0] = byte;
+        root
+    }
+
+    fn depth10_elements(sibling0: &str) -> Vec<String> {
+        let mut elements = vec!["00".repeat(32); proof::RLN_TREE_DEPTH];
+        elements[0] = sibling0.to_string();
+        elements
+    }
+
+    fn depth10_proof(root: [u8; 32], sibling0: &str, valid: &[[u8; 32]]) -> serde_json::Value {
+        serde_json::json!({
+            "depth": proof::RLN_TREE_DEPTH,
+            "leaf": "00".repeat(32),
+            "leaf_index": 5,
+            "path_elements": depth10_elements(sibling0),
+            "path_indices": vec![0u64; proof::RLN_TREE_DEPTH],
+            "root": registry_id::bytes_to_hex(&root),
+            "valid_roots": valid
+                .iter()
+                .map(|r| registry_id::bytes_to_hex(r))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    struct OpenMembership {
+        dir: std::path::PathBuf,
+        store: Arc<Store>,
+        hash: String,
+        rln_id_hex: String,
+        _imp: crate::test_support::TestImp,
+    }
+
+    fn open_membership(tag: &str, registry: &str) -> OpenMembership {
+        let dir = std::env::temp_dir().join(format!("rln-root-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (imp, store) = imp_with_store(dir.clone());
+        assert!(imp
+            .unlock_keystore("pw".into())
+            .contains(r#""unlocked":true"#));
+        let rln_id_hex = "ef".repeat(32);
+        let (commitment_hex, secret_hex) = proof::generate_identity().expect("test identity");
+        let commitment = registry_id::hex_to_bytes32(&commitment_hex).expect("commitment");
+        let hash = registry_id::membership_hash(registry, &commitment);
+        seed_membership(
+            &store,
+            &hash,
+            registry,
+            &commitment_hex,
+            &rln_id_hex,
+            &secret_hex,
+            MembershipState::Active,
+            5,
+            100,
+        );
+        OpenMembership {
+            dir,
+            store,
+            hash,
+            rln_id_hex,
+            _imp: imp,
+        }
+    }
+
+    fn install_proof_tree(proof: Option<serde_json::Value>) {
+        use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+        crate::test_support::install_backend(fake::backend(
+            FakeTree { proof, roots: None },
+            FakeRegistry::default(),
+            FakePayer::default(),
+        ));
+    }
+
+    fn budget_left(store: &Store, hash: &str, rln_id_hex: &str) -> u64 {
+        let size = epoch_size().unwrap();
+        let epoch = rate_limit::current_epoch(now_unix(), size);
+        store
+            .remaining_budget(hash, rln_id_hex, epoch, 100, size)
+            .expect("budget")
+    }
+
+    fn close_membership(opened: &OpenMembership) {
+        sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&opened.dir);
+    }
+
+    #[test]
+    fn generate_proof_accepts_a_cached_root_inside_the_window() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let registry = "fakens:local:root-in";
+        let opened = open_membership("in", registry);
+        let new_root = le_root(2);
+        path_cache::set_rooted_path_for_test(
+            &opened.hash,
+            depth10_elements(&"00".repeat(32)),
+            vec![0u8; proof::RLN_TREE_DEPTH],
+            5,
+            new_root,
+        );
+        let version = path_cache::hit(&opened.hash, 5).unwrap().version;
+        roots::set_window_for_test(registry, vec![new_root], now_unix());
+        install_proof_tree(None);
+
+        let out = generate_proof_impl(
+            Ok(Arc::clone(&opened.store)),
+            registry,
+            &opened.rln_id_hex,
+            "aa",
+            &now_unix().to_string(),
+        )
+        .expect("a root inside the window proves without a refill");
+        assert!(
+            out.get("proof").and_then(|v| v.as_str()).is_some(),
+            "got: {out}"
+        );
+        assert_eq!(out["message_id"].as_u64(), Some(0), "got: {out}");
+        assert_eq!(
+            path_cache::hit(&opened.hash, 5).unwrap().version,
+            version,
+            "an accepted root must not refill"
+        );
+        assert_eq!(
+            budget_left(&opened.store, &opened.hash, &opened.rln_id_hex),
+            99
+        );
+
+        close_membership(&opened);
+    }
+
+    #[test]
+    fn generate_proof_refreshes_a_cached_root_that_left_the_window() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let registry = "fakens:local:root-stale";
+        let opened = open_membership("stale", registry);
+        let old_root = le_root(1);
+        let new_root = le_root(2);
+        path_cache::set_rooted_path_for_test(
+            &opened.hash,
+            depth10_elements(&format!("04{}", "00".repeat(31))),
+            vec![0u8; proof::RLN_TREE_DEPTH],
+            5,
+            old_root,
+        );
+        let before = path_cache::hit(&opened.hash, 5).unwrap();
+        roots::set_window_for_test(registry, vec![new_root], now_unix());
+        let sibling = format!("03{}", "00".repeat(31));
+        install_proof_tree(Some(depth10_proof(new_root, &sibling, &[new_root])));
+
+        let out = generate_proof_impl(
+            Ok(Arc::clone(&opened.store)),
+            registry,
+            &opened.rln_id_hex,
+            "aa",
+            &now_unix().to_string(),
+        )
+        .expect("a refreshed root inside the window proves");
+        assert!(
+            out.get("proof").and_then(|v| v.as_str()).is_some(),
+            "got: {out}"
+        );
+        let after = path_cache::hit(&opened.hash, 5).expect("refreshed path");
+        assert_eq!(after.root, Some(new_root));
+        assert_ne!(after.path_elements_hex, before.path_elements_hex);
+        assert!(after.version > before.version);
+        assert_eq!(
+            budget_left(&opened.store, &opened.hash, &opened.rln_id_hex),
+            99
+        );
+
+        close_membership(&opened);
+    }
+
+    #[test]
+    fn generate_proof_refuses_a_root_that_stays_outside_the_window() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        start_impl(r#"{"epoch_size_sec": 600}"#).unwrap();
+        let registry = "fakens:local:root-stuck";
+        let opened = open_membership("stuck", registry);
+        let stale = le_root(3);
+        let old_root = le_root(1);
+        let new_root = le_root(2);
+        path_cache::set_rooted_path_for_test(
+            &opened.hash,
+            depth10_elements(&"00".repeat(32)),
+            vec![0u8; proof::RLN_TREE_DEPTH],
+            5,
+            stale,
+        );
+        let before = path_cache::hit(&opened.hash, 5).unwrap().version;
+        roots::set_window_for_test(registry, vec![new_root], now_unix());
+        // The proof's valid_roots omit its own root, so the refill adopts a
+        // window the new path is still outside.
+        install_proof_tree(Some(depth10_proof(old_root, &"00".repeat(32), &[new_root])));
+        assert_eq!(
+            budget_left(&opened.store, &opened.hash, &opened.rln_id_hex),
+            100
+        );
+
+        let err = generate_proof_impl(
+            Ok(Arc::clone(&opened.store)),
+            registry,
+            &opened.rln_id_hex,
+            "aa",
+            &now_unix().to_string(),
+        )
+        .expect_err("a root that stays outside the window must not prove");
+        assert_eq!(err.kind, ErrorKind::NotReady, "got: {}", err.message);
+        assert_eq!(err.kind.class(), "not_ready");
+        assert!(
+            err.message.contains("accepted-root window"),
+            "got: {}",
+            err.message
+        );
+        let after = path_cache::hit(&opened.hash, 5).expect("refill still publishes");
+        assert_eq!(after.root, Some(old_root));
+        assert!(
+            after.version > before,
+            "the refusal happens after one refresh"
+        );
+        assert_eq!(
+            budget_left(&opened.store, &opened.hash, &opened.rln_id_hex),
+            100,
+            "no message id is reserved"
+        );
+
+        close_membership(&opened);
     }
 }

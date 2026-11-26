@@ -11,6 +11,9 @@ struct CachedPath {
     path_indices: Vec<u8>,
     leaf_index: u64,
     version: u64,
+    /// Lifted Merkle root from the registry. Absent when a test planted the
+    /// path; generate_proof then skips the accepted-root check.
+    root: Option<[u8; 32]>,
 }
 
 struct PathSlot {
@@ -27,6 +30,7 @@ pub(crate) struct ServedPath {
     pub(crate) path_elements_hex: Vec<String>,
     pub(crate) path_indices: Vec<u8>,
     pub(crate) version: u64,
+    pub(crate) root: Option<[u8; 32]>,
 }
 
 pub(crate) struct PreparedPath {
@@ -34,6 +38,7 @@ pub(crate) struct PreparedPath {
     pub(crate) path_indices: Vec<u8>,
     pub(crate) leaf_index: u64,
     pub(crate) version: u64,
+    pub(crate) root: Option<[u8; 32]>,
 }
 
 pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<ServedPath> {
@@ -43,6 +48,7 @@ pub(crate) fn hit(hash: &str, current_leaf_index: u64) -> Option<ServedPath> {
         path_elements_hex: entry.path_elements_hex.clone(),
         path_indices: entry.path_indices.clone(),
         version: entry.version,
+        root: entry.root,
     })
 }
 
@@ -77,6 +83,7 @@ pub(crate) fn fetch_path(
         path_indices: witness.path_indices,
         leaf_index,
         version,
+        root: Some(witness.root),
     })
 }
 
@@ -98,6 +105,7 @@ pub(crate) fn publish_path(hash: &str, prepared: PreparedPath) -> bool {
         path_indices: prepared.path_indices,
         leaf_index: prepared.leaf_index,
         version: prepared.version,
+        root: prepared.root,
     });
     true
 }
@@ -128,6 +136,28 @@ pub(crate) fn set_path_for_test(
             path_indices,
             leaf_index,
             version,
+            root: None,
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_rooted_path_for_test(
+    hash: &str,
+    path_elements_hex: Vec<String>,
+    path_indices: Vec<u8>,
+    leaf_index: u64,
+    root: [u8; 32],
+) {
+    let version = claim_version(hash);
+    publish_path(
+        hash,
+        PreparedPath {
+            path_elements_hex,
+            path_indices,
+            leaf_index,
+            version,
+            root: Some(root),
         },
     );
 }
@@ -161,7 +191,12 @@ mod tests {
         let window = crate::roots::window(&registry.canonical).expect("window kept");
         assert_eq!(window.len(), 5);
         assert_eq!((window[0], window[1]), (expected, [1; 32]));
-        assert!(hit("path-cache-test-admit", 3).is_some());
+        let served = hit("path-cache-test-admit", 3).expect("path served");
+        assert_eq!(
+            served.root,
+            Some(expected),
+            "the slot keeps the lifted root"
+        );
     }
 
     #[test]
@@ -211,6 +246,7 @@ mod tests {
                 path_indices: vec![1],
                 leaf_index: 2,
                 version: newer,
+                root: Some([2; 32]),
             }
         ));
         assert!(
@@ -221,6 +257,7 @@ mod tests {
                     path_indices: vec![0],
                     leaf_index: 1,
                     version: older,
+                    root: Some([1; 32]),
                 }
             ),
             "a slow fetch must not publish over a newer generation"
@@ -228,6 +265,7 @@ mod tests {
         let served = hit(hash, 2).expect("newer path stays visible");
         assert_eq!(served.path_elements_hex, vec!["22".repeat(32)]);
         assert_eq!(served.version, newer);
+        assert_eq!(served.root, Some([2; 32]));
         assert!(hit(hash, 1).is_none());
     }
 }
